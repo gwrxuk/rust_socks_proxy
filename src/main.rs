@@ -62,10 +62,10 @@ async fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
     }
 }
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:1080").await?;
-    println!("Listening on 127.0.0.1:1080");
+// start_server function encapsulates the server initialization and loop
+async fn start_server(addr: &str) -> io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    println!("Listening on {}", addr);
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -77,4 +77,31 @@ async fn main() -> io::Result<()> {
     }
 }
 
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    start_server("127.0.0.1:1080").await
+}
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn test_server_accepts_connections() {
+        let server_addr = "127.0.0.1:12345";
+        tokio::spawn(async move {
+            // Start the server in a background task
+            let _ = start_server(server_addr).await;
+        });
+
+        // Give the server a moment to start up
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Attempt to connect to the server
+        let client_result = TcpStream::connect(server_addr).await;
+
+        assert!(client_result.is_ok());
+    }
+}

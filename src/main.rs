@@ -1,85 +1,90 @@
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls;
+use rustls_pemfile::{certs, rsa_private_keys};
+use tokio_rustls::server::TlsStream;
+use std::fs::File;
+use std::io::BufReader;
 
-async fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
-    // Step 1: Handle the greeting and select no authentication
-    let mut buf = [0; 262];
-    let _ = stream.read(&mut buf).await?;
-    // Assuming the client supports no authentication, respond accordingly
-    stream.write_all(&[0x05, 0x00]).await?;
 
-    // Step 2: Handle the client's connection request
-    let mut request_buf = [0; 4];
-    stream.read_exact(&mut request_buf).await?;
-    if request_buf[1] != 0x01 {
-        // Only handle CONNECT command (0x01)
-        return Ok(());
+
+fn load_tls_config() -> io::Result<rustls::ServerConfig> {
+    let cert_file = &mut BufReader::new(File::open("cert/cert.pem")?);
+    let key_file = &mut BufReader::new(File::open("cert/key.pem")?);
+    let key_file2 = &mut BufReader::new(File::open("cert/key.pem")?);
+    
+    let key2: Vec<_> = rsa_private_keys(key_file2).collect();
+
+    println!("{:?}",key2);
+
+    let cert_chain = certs(cert_file)
+    .into_iter()
+    .map(|x| rustls::Certificate(x.unwrap().to_vec()))
+    .collect();
+
+    let key = rsa_private_keys(key_file)
+    .into_iter()
+    .next()
+    .map(|x| rustls::PrivateKey(x.unwrap().secret_pkcs1_der().to_vec()))
+    .unwrap();
+
+   let config = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .expect("Failed to build TLS configuration");
+
+    Ok(config)
+}
+
+async fn handle_connection(mut stream: TlsStream<TcpStream>) -> io::Result<()> {
+    let mut buf = [0; 1024];
+
+    loop {
+        let nbytes = stream.read(&mut buf).await?;
+        if nbytes == 0 {
+            break; // Connection was closed or we read all the data
+        }
+
+        // Echo the data back to the client as an example operation
+        stream.write_all(&buf[0..nbytes]).await?;
     }
 
-    // Read the address type and destination address
-    let addr_type = request_buf[3];
-    let destination = match addr_type {
-        0x01 => { // IPv4
-            let mut addr_buf = [0; 4];
-            stream.read_exact(&mut addr_buf).await?;
-            format!("{}.{}.{}.{}", addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3])
-        },
-        0x03 => { // Domain name
-            let mut len_buf = [0; 1];
-            stream.read_exact(&mut len_buf).await?;
-            let len = len_buf[0] as usize;
-            let mut addr_buf = vec![0; len];
-            stream.read_exact(&mut addr_buf).await?;
-            String::from_utf8(addr_buf).unwrap_or_default()
-        },
-        // Add handling for IPv6 if needed
-        _ => return Ok(()),
-    };
-
-    // Read the port
-    let mut port_buf = [0; 2];
-    stream.read_exact(&mut port_buf).await?;
-    let port = u16::from_be_bytes(port_buf);
-
-    // Step 3: Connect to the destination
-    match TcpStream::connect(format!("{}:{}", destination, port)).await {
-        Ok(mut dest_stream) => {
-            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?; // Reply success
-            let (mut client_reader, mut client_writer) = stream.split();
-            let (mut dest_reader, mut dest_writer) = dest_stream.split();
-
-            tokio::try_join!(
-                tokio::io::copy(&mut client_reader, &mut dest_writer),
-                tokio::io::copy(&mut dest_reader, &mut client_writer)
-            )?;
-
-            Ok(())
-        }
-        Err(_) => {
-            stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?; // Reply with general failure
-            Ok(())
-        }
-    }
+    Ok(())
 }
 
 // start_server function encapsulates the server initialization and loop
-async fn start_server(addr: &str) -> io::Result<()> {
+async fn start_server(addr: &str, tls_config: rustls::ServerConfig) -> io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config));
+
     println!("Listening on {}", addr);
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let acceptor = tls_acceptor.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream).await {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(tls_stream) => tls_stream,
+                Err(e) => {
+                    eprintln!("Failed to accept TLS connection: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = handle_connection(tls_stream).await {
                 eprintln!("Failed to handle connection: {}", e);
             }
         });
     }
 }
 
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    start_server("127.0.0.1:1080").await
+    let tls_config = load_tls_config()?;
+    start_server("127.0.0.1:1080", tls_config).await
 }
 
 
